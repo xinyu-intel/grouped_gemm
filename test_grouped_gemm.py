@@ -47,7 +47,7 @@ def ref_prologue(
     expert_start_id = num_experts * ep_rank
     expert_end_id = expert_start_id + num_experts
 
-    idxs = flat_expert_indices.argsort()
+    idxs = flat_expert_indices.argsort(stable=True)
     counts = flat_expert_indices.bincount().cpu().numpy()
     tokens_per_expert = counts.cumsum()
     token_idxs = idxs // num_per_tok
@@ -235,6 +235,15 @@ def test_triton_grouped_gemm(input_A, input_B, topk_ids, topk):
     )
 
     output = workspace.clone().view(-1, n)
+    # Triton writes C at flattened route positions (token_idx * topk + k_idx).
+    # sorted_token_ids is padded with sentinel num_tokens for block alignment,
+    # so keep only true (non-padding) route indices.
+    num_tokens = m * topk
+    valid_sorted_token_ids = sorted_token_ids[sorted_token_ids < num_tokens].to(
+        torch.long
+    )
+    assert valid_sorted_token_ids.numel() == num_tokens
+    output_triton_grouped = output[valid_sorted_token_ids]
 
     iters = 100
     startEvent = torch.Event(enable_timing=True)
@@ -269,7 +278,7 @@ def test_triton_grouped_gemm(input_A, input_B, topk_ids, topk):
         f"Triton Grouped GEMM Average latency: {startEvent.elapsed_time(endEvent) * 1000 / iters:.2f} us"
     )
 
-    return output
+    return output_triton_grouped
 
 
 def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
@@ -294,7 +303,7 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     )
 
     torch.testing.assert_close(output_sycltla, output_ref, rtol=2e-2, atol=1e-2)
-    # torch.testing.assert_close(output_triton, output_ref, rtol=2e-2, atol=1e-2)
+    torch.testing.assert_close(output_triton, output_ref, rtol=2e-2, atol=1e-2)
 
 
 if __name__ == "__main__":
@@ -303,9 +312,9 @@ if __name__ == "__main__":
         "Testing Qwen3-30B-A3B-Instruct with MNK factors (80, 768 * 2 // 4, 2048), num_experts=128, topk=8"
     )
     test_grouped_gemm(80, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
-    # print("Testing Qwen3-30B-A3B-Instruct with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8")
-    # test_xe_grouped_gemm(8192, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
-    # print("Testing Llama-4-scout with MNK factors (30, 8192 * 2, 5120), num_experts=16, topk=1")
-    # test_xe_grouped_gemm(30, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
-    # print("Testing Llama-4-scout with MNK factors (8192, 8192 * 2, 5120), num_experts=16, topk=1")
-    # test_xe_grouped_gemm(8192, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
+    print("Testing Qwen3-30B-A3B-Instruct with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8")
+    test_grouped_gemm(8192, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
+    print("Testing Llama-4-scout with MNK factors (30, 8192 * 2, 5120), num_experts=16, topk=1")
+    test_grouped_gemm(30, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
+    print("Testing Llama-4-scout with MNK factors (8192, 8192 * 2, 5120), num_experts=16, topk=1")
+    test_grouped_gemm(8192, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
