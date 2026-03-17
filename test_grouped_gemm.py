@@ -309,11 +309,17 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
 if __name__ == "__main__":
     print("Testing grouped GEMM on Xe...")
     print(
-        "Testing Qwen3-30B-A3B-Instruct with MNK factors (80, 768 * 2 // 4, 2048), num_experts=128, topk=8"
+        "Testing Qwen3-30B-A3B-Instruct w13 with MNK factors (80, 768 * 2 // 4, 2048), num_experts=128, topk=8"
     )
     test_grouped_gemm(80, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
-    print("Testing Qwen3-30B-A3B-Instruct with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8")
+    print(
+        "Testing Qwen3-30B-A3B-Instruct w2 with MNK factors (80, 2048, 768 * 2 // 2 // 4), num_experts=128, topk=8"
+    )
+    test_grouped_gemm(80, 2048, 768 * 2 // 2 // 4, 128, 8, torch.bfloat16, False)
+    print("Testing Qwen3-30B-A3B-Instruct w13 with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8")
     test_grouped_gemm(8192, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
+    print("Testing Qwen3-30B-A3B-Instruct w2 with MNK factors (8192, 2048, 768 * 2 // 2 // 4), num_experts=128, topk=8")
+    test_grouped_gemm(8192, 2048, 768 * 2 // 2 // 4, 128, 8, torch.bfloat16, False)
     print("Testing Llama-4-scout with MNK factors (30, 8192 * 2, 5120), num_experts=16, topk=1")
     test_grouped_gemm(30, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
     print("Testing Llama-4-scout with MNK factors (8192, 8192 * 2, 5120), num_experts=16, topk=1")
