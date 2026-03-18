@@ -7,6 +7,19 @@ import triton
 import triton.language as tl
 
 
+if hasattr(triton.language, "_experimental_make_tensor_descriptor"):
+    # Triton 3.3.x
+    make_tensor_descriptor = triton.language._experimental_make_tensor_descriptor
+elif hasattr(triton.language, "make_tensor_descriptor"):
+    # Triton 3.4.x+
+    make_tensor_descriptor = triton.language.make_tensor_descriptor
+else:
+
+    @triton.jit
+    def make_tensor_descriptor(base, shape, strides, block_shape, _builder=None):
+        return None
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -176,8 +189,11 @@ def write_zeros_to_output(
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
+    a_desc,
     b_ptr,
+    b_desc,
     c_ptr,
+    c_desc,
     b_bias_ptr,
     a_scale_ptr,
     b_scale_ptr,
@@ -226,6 +242,7 @@ def fused_moe_kernel(
     use_int8_w8a16: tl.constexpr,
     per_channel_quant: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    USE_TMA: tl.constexpr,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -313,17 +330,22 @@ def fused_moe_kernel(
         )
         return
 
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_bn_base = pid_n * BLOCK_SIZE_N
+    offs_bn = (offs_bn_base + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + (
-        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
-    )
+    if USE_TMA and naive_block_assignment and a_desc is not None:
+        offs_am = (pid_m * BLOCK_SIZE_M).to(tl.int32)
+    else:
+        a_ptrs = a_ptr + (
+            offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+        )
 
-    b_ptrs = (
-        b_ptr
-        + off_experts * stride_be
-        + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    )
+    if not (USE_TMA and b_desc is not None):
+        b_ptrs = (
+            b_ptr
+            + off_experts * stride_be
+            + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+        )
     if use_int8_w8a16:
         b_scale_ptrs = (
             b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
@@ -364,12 +386,30 @@ def fused_moe_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-        a = tl.load(
-            a_ptrs,
-            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
-            other=0.0,
-        )
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        if USE_TMA and naive_block_assignment and a_desc is not None:
+            a = a_desc.load([offs_am, (k * BLOCK_SIZE_K).to(tl.int32)])
+        else:
+            a = tl.load(
+                a_ptrs,
+                mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+                other=0.0,
+            )
+
+        if USE_TMA and b_desc is not None:
+            b = b_desc.load(
+                [
+                    off_experts.to(tl.int32),
+                    offs_bn_base.to(tl.int32),
+                    (k * BLOCK_SIZE_K).to(tl.int32),
+                ]
+            )
+            b = b.reshape(BLOCK_SIZE_N, BLOCK_SIZE_K).T
+        else:
+            b = tl.load(
+                b_ptrs,
+                mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+                other=0.0,
+            )
         # We accumulate along the K dimension.
         if use_int8_w8a16:
             accumulator = tl.dot(a, b.to(compute_type), acc=accumulator)
@@ -392,8 +432,10 @@ def fused_moe_kernel(
         else:
             accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        if not (USE_TMA and naive_block_assignment and a_desc is not None):
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+        if not (USE_TMA and b_desc is not None):
+            b_ptrs += BLOCK_SIZE_K * stride_bk
 
     # Dequantization for supported quantization schemes:
     #   - int8_w8a16
@@ -430,10 +472,19 @@ def fused_moe_kernel(
 
     # -----------------------------------------------------------
     # Write back the block of the output
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, accumulator, mask=c_mask)
+    if USE_TMA and naive_block_assignment and c_desc is not None:
+        c_desc.store(
+            [
+                (pid_m * BLOCK_SIZE_M).to(tl.int32),
+                (pid_n * BLOCK_SIZE_N).to(tl.int32),
+            ],
+            accumulator,
+        )
+    else:
+        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+        c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+        tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
 def invoke_fused_moe_triton_kernel(
@@ -457,6 +508,7 @@ def invoke_fused_moe_triton_kernel(
     per_channel_quant: bool,
     block_shape: list[int] | None = None,
     B_bias: torch.Tensor | None = None,
+    use_tma: bool = False,
 ):
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
@@ -502,10 +554,32 @@ def invoke_fused_moe_triton_kernel(
     BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
     if block_shape is not None:
         BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0], block_shape[1]))
+
+    a_desc = None
+    b_desc = None
+    c_desc = None
+    if use_tma and hasattr(triton, "tools") and hasattr(triton.tools, "tensor_descriptor"):
+        if sorted_token_ids is None:
+            a_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+                A,
+                [config["BLOCK_SIZE_M"], BLOCK_SIZE_K],
+            )
+            c_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+                C.view(-1, C.size(-1)),
+                [config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"]],
+            )
+        b_desc = triton.tools.tensor_descriptor.TensorDescriptor.from_tensor(
+            B,
+            [1, config["BLOCK_SIZE_N"], BLOCK_SIZE_K],
+        )
+
     fused_moe_kernel[grid](
         A,
+        a_desc,
         B,
+        b_desc,
         C,
+        c_desc,
         B_bias,
         A_scale,
         B_scale,
@@ -542,6 +616,7 @@ def invoke_fused_moe_triton_kernel(
         per_channel_quant=per_channel_quant,
         naive_block_assignment=(sorted_token_ids is None),
         HAS_BIAS=HAS_BIAS,
+        USE_TMA=use_tma,
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         **config,
     )

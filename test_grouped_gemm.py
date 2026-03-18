@@ -232,6 +232,7 @@ def test_triton_grouped_gemm(input_A, input_B, topk_ids, topk):
         False,
         None,
         None,
+        False,
     )
 
     output = workspace.clone().view(-1, n)
@@ -271,6 +272,7 @@ def test_triton_grouped_gemm(input_A, input_B, topk_ids, topk):
             False,
             None,
             None,
+            False,
         )
     endEvent.record()
     torch.accelerator.synchronize()
