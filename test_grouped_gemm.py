@@ -10,6 +10,7 @@ from triton_grouped_gemm import (
     torch_moe_align_block_size,
     get_default_config,
 )
+from triton_batched_moe import invoke_moe_batched_triton_kernel
 import triton.language as tl
 
 import vllm_xpu_kernels._C
@@ -173,6 +174,34 @@ def ref_grouped_gemm(input_A, input_B, topk_ids, topk):
     return ref
 
 
+def ref_batched_grouped_gemm(input_A, input_B, topk_ids):
+    """
+    Token-major reference for batched MoE GEMM.
+    Returns shape [m, n], where each token accumulates outputs from all
+    selected experts (without router weights).
+    """
+    m = input_A.shape[0]
+    n = input_B.shape[-1]
+    topk = topk_ids.shape[1]
+    dtype = input_A.dtype
+
+    out = torch.zeros((m, n), dtype=torch.float32, device=DEVICE)
+    x_fp32 = input_A.to(torch.float32)
+    w_fp32 = input_B.to(torch.float32)
+
+    for k_idx in range(topk):
+        experts = topk_ids[:, k_idx].to(torch.long)
+        # Kernel writes each expert GEMM tile in bf16, then host sums experts.
+        # Mirror that here to avoid optimistic one-shot fp32->bf16 rounding.
+        contrib = torch.bmm(
+            x_fp32.unsqueeze(1),
+            w_fp32[experts],
+        ).squeeze(1)
+        out += contrib.to(dtype).to(torch.float32)
+
+    return out.to(dtype)
+
+
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     """
     Shrink the given tensor and apply the given view to it.  This is
@@ -281,6 +310,108 @@ def test_triton_grouped_gemm(input_A, input_B, topk_ids, topk):
     return output_triton_grouped
 
 
+def test_triton_batched_grouped_gemm(input_A, input_B, topk_weights, topk_ids, topk):
+    seed_everything(7)
+    m = input_A.shape[0]
+    k = input_A.shape[1]
+    n = input_B.shape[-1]
+    num_experts = input_B.shape[0]
+
+    input_B = input_B.transpose(1, 2).contiguous()
+
+    ws_shape = (num_experts, m, n)
+    workspace = _resize_cache(
+        torch.empty(
+            ws_shape[0] * ws_shape[1] * ws_shape[2],
+            dtype=input_A.dtype,
+            device=input_A.device,
+        ),
+        (num_experts, m, n),
+    )
+    config = {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 16, "BLOCK_SIZE_K": 16}
+
+    tokens_per_expert = torch.zeros(num_experts, dtype=torch.int, device=DEVICE)
+
+    b_a1 = torch.zeros(
+        (num_experts, m, k),
+        dtype=input_A.dtype,
+        device=DEVICE,
+    )
+
+    first_expert = 0
+    last_expert = first_expert + num_experts
+
+    for expert_id in range(first_expert, last_expert):
+        topks = torch.any(topk_ids == expert_id, dim=1).flatten()
+        rows = torch.count_nonzero(topks.flatten())
+        if rows == 0:
+            continue
+        idx = expert_id - first_expert
+        tokens_per_expert[idx] = rows
+        rhs = input_A[: topks.numel()][topks]
+        b_a1[idx, :rows, :] = rhs
+
+    invoke_moe_batched_triton_kernel(
+        A=b_a1,
+        B=input_B,
+        C=workspace,
+        expert_num_tokens=tokens_per_expert,
+        compute_type=tl.bfloat16,
+        A_scale=None,
+        B_scale=None,
+        B_zp=None,
+        use_fp8_w8a8=False,
+        use_int8_w8a16=False,
+        use_int4_w4a16=False,
+        config=config,
+        per_act_token_quant=False,
+        block_shape=None,
+    )
+
+    # Accumulate in fp32 to reduce numerical error from top-k expert summation.
+    output = torch.zeros(
+        (m, n),
+        device=DEVICE,
+        dtype=torch.float32,
+    )
+
+    for expert_id in range(first_expert, last_expert):
+        matching_tokens = topk_ids == expert_id
+        topks = torch.any(matching_tokens, dim=1).flatten()
+        rows = torch.count_nonzero(topks)
+        rhs = workspace[expert_id - first_expert, :rows, :].to(torch.float32)
+        output[topks] = output[topks] + rhs
+
+    iters = 100
+    startEvent = torch.Event(enable_timing=True)
+    endEvent = torch.Event(enable_timing=True)
+    startEvent.record()
+    for i in range(iters):
+        invoke_moe_batched_triton_kernel(
+            A=b_a1,
+            B=input_B,
+            C=workspace,
+            expert_num_tokens=tokens_per_expert,
+            compute_type=tl.bfloat16,
+            A_scale=None,
+            B_scale=None,
+            B_zp=None,
+            use_fp8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            config=config,
+            per_act_token_quant=False,
+            block_shape=None,
+        )
+    endEvent.record()
+    torch.accelerator.synchronize()
+    print(
+        f"Triton Batched Grouped GEMM Average latency: {startEvent.elapsed_time(endEvent) * 1000 / iters:.2f} us"
+    )
+
+    return output.to(input_A.dtype)
+
+
 def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     seed_everything(7)
     num_experts = e
@@ -305,6 +436,23 @@ def test_grouped_gemm(m, n, k, e, topk, dtype, has_bias):
     torch.testing.assert_close(output_sycltla, output_ref, rtol=2e-2, atol=1e-2)
     torch.testing.assert_close(output_triton, output_ref, rtol=2e-2, atol=1e-2)
 
+    if m * topk < 1024:  # Avoid large numerical error from summing many experts.
+        output_triton_batched = test_triton_batched_grouped_gemm(
+            input_A=hidden_states,
+            input_B=input_B,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            topk=topk,
+        )
+        output_ref_batched = ref_batched_grouped_gemm(
+            input_A=hidden_states,
+            input_B=input_B,
+            topk_ids=topk_ids,
+        )
+        torch.testing.assert_close(
+            output_triton_batched, output_ref_batched, rtol=2e-2, atol=1e-2
+        )
+
 
 if __name__ == "__main__":
     print("Testing grouped GEMM on Xe...")
@@ -316,11 +464,19 @@ if __name__ == "__main__":
         "Testing Qwen3-30B-A3B-Instruct w2 with MNK factors (80, 2048, 768 * 2 // 2 // 4), num_experts=128, topk=8"
     )
     test_grouped_gemm(80, 2048, 768 * 2 // 2 // 4, 128, 8, torch.bfloat16, False)
-    print("Testing Qwen3-30B-A3B-Instruct w13 with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8")
+    print(
+        "Testing Qwen3-30B-A3B-Instruct w13 with MNK factors (8192, 768 * 2 // 4, 2048), num_experts=128, topk=8"
+    )
     test_grouped_gemm(8192, 768 * 2 // 4, 2048, 128, 8, torch.bfloat16, False)
-    print("Testing Qwen3-30B-A3B-Instruct w2 with MNK factors (8192, 2048, 768 * 2 // 2 // 4), num_experts=128, topk=8")
+    print(
+        "Testing Qwen3-30B-A3B-Instruct w2 with MNK factors (8192, 2048, 768 * 2 // 2 // 4), num_experts=128, topk=8"
+    )
     test_grouped_gemm(8192, 2048, 768 * 2 // 2 // 4, 128, 8, torch.bfloat16, False)
-    print("Testing Llama-4-scout with MNK factors (30, 8192 * 2, 5120), num_experts=16, topk=1")
+    print(
+        "Testing Llama-4-scout with MNK factors (30, 8192 * 2, 5120), num_experts=16, topk=1"
+    )
     test_grouped_gemm(30, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
-    print("Testing Llama-4-scout with MNK factors (8192, 8192 * 2, 5120), num_experts=16, topk=1")
+    print(
+        "Testing Llama-4-scout with MNK factors (8192, 8192 * 2, 5120), num_experts=16, topk=1"
+    )
     test_grouped_gemm(8192, 8192 * 2, 5120, 16, 1, torch.bfloat16, False)
